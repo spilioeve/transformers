@@ -17,6 +17,8 @@ import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, NewType, Optional, Tuple, Union
 
+from datasets import flatten_nest_dict
+
 from ..file_utils import PaddingStrategy
 from ..models.bert import BertTokenizer, BertTokenizerFast
 from ..tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
@@ -841,6 +843,69 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
         # The rest of the time (10% of the time) we keep the masked input tokens unchanged
         return inputs, labels
 
+@dataclass
+class DataCollatorForPromptMasking(DataCollatorMixin):
+    """
+    Data collator used for prompt language modeling. Inputs are dynamically padded to the maximum length of a batch if they
+    are not all of the same length.
+
+    Args:
+        tokenizer ([`PreTrainedTokenizer`] or [`PreTrainedTokenizerFast`]):
+            The tokenizer used for encoding the data.
+"""
+    
+    tokenizer: PreTrainedTokenizerBase
+    mlm: bool = True
+    mlm_probability: float = 0.15
+    pad_to_multiple_of: Optional[int] = None
+    tf_experimental_compile: bool = False
+    return_tensors: str = "pt"
+
+    def __post_init__(self):
+        if self.mlm and self.tokenizer.mask_token is None:
+            raise ValueError(
+                "This tokenizer does not have a mask token which is necessary for masked language modeling. "
+                "You should pass `mlm=False` to train on causal language modeling instead."
+            )
+
+    def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
+        # Handle dict or lists with proper padding and conversion to tensor.
+        labels = [example['labels'] for example in examples]
+        batch = []
+        for example in examples:
+            elt = {}
+            for k,v in example.items():
+                if k != 'labels':
+                    elt[k]=v
+            batch.append(elt)
+        
+        batch = self.tokenizer.pad(batch, return_tensors="pt", pad_to_multiple_of=self.pad_to_multiple_of)
+
+        batch["input_ids"], batch["labels"] = self.torch_mask_tokens(
+            batch["input_ids"], labels
+        )
+        return batch
+
+    def torch_mask_tokens(self, inputs: Any, label_list: Any) -> Tuple[Any, Any]:
+        """
+        Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original.
+        """
+        import torch
+
+        labels = inputs.clone()
+
+        masked_indices = inputs == self.tokenizer.mask_token_id
+        # if sum(masked_indices.flatten()) != len([elt for l in label_list for elt in l]):
+        #     import pdb; pdb.set_trace()
+        flattened_labels = []
+        for i in range(len(inputs)):
+            assert len(label_list[i]) >= torch.sum(masked_indices[i]) # inputs could be truncated and thus shorter
+            flattened_labels += label_list[i][:torch.sum(masked_indices[i]).item()]
+        assert len(flattened_labels) == torch.sum(masked_indices) 
+        labels[masked_indices] = torch.tensor(flattened_labels, device=inputs.device) # The targets of the masks are passed as label_list
+        labels[~masked_indices] = -100  # We only compute loss on masked tokens
+
+        return inputs, labels
 
 @dataclass
 class DataCollatorForWholeWordMask(DataCollatorForLanguageModeling):

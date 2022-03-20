@@ -79,6 +79,7 @@ _import_structure = {
     "data.data_collator": [
         "DataCollator",
         "DataCollatorForLanguageModeling",
+        "DataCollatorForPromptMasking",
         "DataCollatorForPermutationLanguageModeling",
         "DataCollatorForSeq2Seq",
         "DataCollatorForSOP",
@@ -2346,6 +2347,7 @@ if TYPE_CHECKING:
     from .data.data_collator import (
         DataCollator,
         DataCollatorForLanguageModeling,
+        DataCollatorForPromptMasking,
         DataCollatorForPermutationLanguageModeling,
         DataCollatorForSeq2Seq,
         DataCollatorForSOP,
