@@ -50,6 +50,7 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
+from sklearn.metrics import f1_score, recall_score, precision_score
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.17.0.dev0")
@@ -60,6 +61,38 @@ logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
+def f1_score_factory(label):
+    def f1_score_bin(y_true, y_pred):
+        return f1_score(
+            y_true, 
+            y_pred, 
+            pos_label=label, 
+            average="binary",
+            zero_division=0,
+        )
+    return f1_score_bin
+
+def precision_score_factory(label):
+    def precision_score_bin(y_true, y_pred):
+        return precision_score(
+            y_true, 
+            y_pred, 
+            pos_label=label, 
+            average="binary",
+            zero_division=0,
+        )
+    return precision_score_bin
+
+def recall_score_factory(label):
+    def recall_score_bin(y_true, y_pred):
+        return recall_score(
+            y_true, 
+            y_pred, 
+            pos_label=label, 
+            average="binary",
+            zero_division=0,
+        )
+    return recall_score_bin
 
 @dataclass
 class ModelArguments:
@@ -465,7 +498,24 @@ def main():
             mask = labels != -100
             labels = labels[mask]
             preds = preds[mask]
-            return metric.compute(predictions=preds, references=labels)
+            metric_dict_output = metric.compute(predictions=preds, references=labels)
+
+            score_names = ['f1', 'prec', 'rec']
+            label_token_ids = {
+                'changed': tokenizer.convert_tokens_to_ids('changed'),
+                'stable': tokenizer.convert_tokens_to_ids('stable')
+            }
+            for label in ['changed', 'stable']:
+                for i, score in enumerate([
+                        f1_score_factory(label_token_ids[label]),
+                        precision_score_factory(label_token_ids[label]),
+                        recall_score_factory(label_token_ids[label])]
+                    ):
+                    computed_score = score(labels, preds)
+                    print(f'{label}_{score_names[i]}', computed_score)
+                    metric_dict_output[f'{label}_{score_names[i]}'] = computed_score
+            return metric_dict_output
+            
 
     # Data collator
     # This one will take care of randomly masking the tokens.
