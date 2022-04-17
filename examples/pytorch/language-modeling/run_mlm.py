@@ -28,6 +28,7 @@ import sys
 from dataclasses import dataclass, field
 from itertools import chain
 from typing import Optional
+import json
 
 import datasets
 from datasets import load_dataset, load_metric
@@ -228,6 +229,39 @@ class DataTrainingArguments:
                     raise ValueError("`validation_file` should be a csv, a json or a txt file.")
 
 
+class MLM_ClassifierTrainer(Trainer):
+    # Link: https://discuss.huggingface.co/t/specify-loss-for-trainer-trainingarguments/10481
+    # They get the logits and estimate loss on them. Maybe we can get logits AND we also need the labels as
+    # global arguments?? 
+    
+    # Custom loss for our Trainer
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+
+        Subclass and override for custom behavior.
+        """
+
+        # What is the label_smoother? Default is None, label_smoothing_factor = 0
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+        outputs = model(**inputs)
+        # Save past state if it exists
+        # TODO: this needs to be fixed and made cleaner later.
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if labels is not None:
+            loss = self.label_smoother(outputs, labels)
+        else:
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        return (loss, outputs) if return_outputs else loss
+
+
 def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
@@ -418,37 +452,49 @@ def main():
     # When using line_by_line, we just tokenize each nonempty line.
     padding = "max_length" if data_args.pad_to_max_length else False
 
+    label_token_ids = {
+        # 'changed': tokenizer.convert_tokens_to_ids('Ġchanged'),
+        # 'stable': tokenizer.convert_tokens_to_ids('Ġstable')
+        'different': tokenizer.convert_tokens_to_ids(tokenizer.tokenize(' different'))[0],
+        'unchanged': tokenizer.convert_tokens_to_ids(tokenizer.tokenize(' unchanged'))[0]
+    }
+
     def tokenize_function(examples):
         # Join the data in a single 'text' column.
         # query0, template0, template1, query1, teamplate0 ...
         # template will have attribute masked. but we will keep it in a labels column.
+        # import pdb; pdb.set_trace()
         mask_token = tokenizer.mask_token
-        prompt = "The {} of the {} is {}."
+        prompt = "The {} of the {} is {}. "
         texts = []
+        texts_unmasked = []
         labels = []
-        label_token_ids = {
-            'changed': tokenizer.convert_tokens_to_ids('changed'),
-            'stable': tokenizer.convert_tokens_to_ids('stable')
-        }
+
         for i in range(len(examples['queries'])):
             text = ''
+            text_unmasked = ''
             label = []
             queries = examples['queries'][i]
             for query in queries:
                 attribute = query['attribute']
                 text += f'{query["query"]} '
+                text_unmasked += f'{query["query"]} '
                 for entity, attribute_changed in zip(query['entities'], query['attribute_changed']):
                     text += prompt.format(attribute, entity, mask_token)
-                    label.append(label_token_ids['changed'] if attribute_changed else label_token_ids['stable'])
+                    text_unmasked += prompt.format(attribute, entity, 'different' if attribute_changed else 'unchanged')
+                    label.append(label_token_ids['different'] if attribute_changed else label_token_ids['unchanged'])
             texts.append(text)
+            texts_unmasked.append(text_unmasked)
             labels.append(label)
 
         # # Remove empty lines
         # examples[text_column_name] = [
         #     line for line in examples[text_column_name] if len(line) > 0 and not line.isspace()
         # ]
+        # import pdb; pdb.set_trace()
         return {
             'texts':texts,
+            'texts_unmasked':texts_unmasked,
             'labels':labels,
             **tokenizer(
                 texts,
@@ -483,8 +529,9 @@ def main():
         eval_dataset = tokenized_datasets["validation"]
         if data_args.max_eval_samples is not None:
             eval_dataset = eval_dataset.select(range(data_args.max_eval_samples))
-
+        
         def preprocess_logits_for_metrics(logits, labels):
+            # import pdb; pdb.set_trace()
             return logits.argmax(dim=-1)
 
         metric = load_metric("accuracy")
@@ -498,14 +545,16 @@ def main():
             mask = labels != -100
             labels = labels[mask]
             preds = preds[mask]
+
+            with open(f'{training_args.output_dir}/predictions.jsonl', 'w') as outfile:
+                for l, p in zip(labels, preds):
+                    outfile.write(f"{json.dumps({'label': int(l), 'pred': int(p)})}\n")
+
             metric_dict_output = metric.compute(predictions=preds, references=labels)
 
             score_names = ['f1', 'prec', 'rec']
-            label_token_ids = {
-                'changed': tokenizer.convert_tokens_to_ids('changed'),
-                'stable': tokenizer.convert_tokens_to_ids('stable')
-            }
-            for label in ['changed', 'stable']:
+
+            for label in ['different', 'unchanged']:
                 for i, score in enumerate([
                         f1_score_factory(label_token_ids[label]),
                         precision_score_factory(label_token_ids[label]),
@@ -516,7 +565,6 @@ def main():
                     metric_dict_output[f'{label}_{score_names[i]}'] = computed_score
             return metric_dict_output
             
-
     # Data collator
     # This one will take care of randomly masking the tokens.
     pad_to_multiple_of_8 = data_args.line_by_line and training_args.fp16 and not data_args.pad_to_max_length
@@ -524,8 +572,20 @@ def main():
         tokenizer=tokenizer,
     )
 
-    # Initialize our Trainer
-    trainer = Trainer(
+    # Initialize our customized Trainer
+
+    # trainer = MLM_ClassifierTrainer(
+    #     model=model,
+    #     args=training_args,
+    #     train_dataset=train_dataset if training_args.do_train else None,
+    #     eval_dataset=eval_dataset if training_args.do_eval else None,
+    #     tokenizer=tokenizer,
+    #     data_collator=data_collator,
+    #     compute_metrics=compute_metrics if training_args.do_eval else None,
+    #     preprocess_logits_for_metrics=preprocess_logits_for_metrics if training_args.do_eval else None,
+    # )
+    
+    trainer = MLM_ClassifierTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,

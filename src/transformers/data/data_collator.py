@@ -869,6 +869,7 @@ class DataCollatorForPromptMasking(DataCollatorMixin):
             )
 
     def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
+        # import pdb; pdb.set_trace()
         # Handle dict or lists with proper padding and conversion to tensor.
         labels = [example['labels'] for example in examples]
         batch = []
@@ -904,7 +905,6 @@ class DataCollatorForPromptMasking(DataCollatorMixin):
         assert len(flattened_labels) == torch.sum(masked_indices) 
         labels[masked_indices] = torch.tensor(flattened_labels, device=inputs.device) # The targets of the masks are passed as label_list
         labels[~masked_indices] = -100  # We only compute loss on masked tokens
-
         return inputs, labels
 
 @dataclass
