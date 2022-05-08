@@ -872,19 +872,34 @@ class DataCollatorForPromptMasking(DataCollatorMixin):
         # import pdb; pdb.set_trace()
         # Handle dict or lists with proper padding and conversion to tensor.
         labels = [example['labels'] for example in examples]
-        batch = []
-        for example in examples:
-            elt = {}
-            for k,v in example.items():
-                if k != 'labels':
-                    elt[k]=v
-            batch.append(elt)
         
+        batch = []
+        # for example in examples:
+        #     elt = {}
+        #     for k,v in example.items():
+        #         if k != 'labels':
+        #             elt[k]=v
+        #     batch.append(elt)
+        for example in examples:
+            elt = {
+                'input_ids': example['input_ids'],
+                'attention_mask': example["attention_mask"]
+            }
+            batch.append(elt)
+       
         batch = self.tokenizer.pad(batch, return_tensors="pt", pad_to_multiple_of=self.pad_to_multiple_of)
 
         batch["input_ids"], batch["labels"] = self.torch_mask_tokens(
             batch["input_ids"], labels
         )
+        
+        # Forward throws an error because it was not expecting this format?? 
+        example_keys = example.keys() - set(['input_ids', 'attention_mask', "labels"])
+        for k in example_keys:
+            batch[k] = []
+            for example in examples:
+                batch[k].append(example[k])
+        
         return batch
 
     def torch_mask_tokens(self, inputs: Any, label_list: Any) -> Tuple[Any, Any]:

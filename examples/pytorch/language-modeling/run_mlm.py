@@ -29,6 +29,10 @@ from dataclasses import dataclass, field
 from itertools import chain
 from typing import Optional
 import json
+#from importlib_metadata import distribution
+from numpy import require
+import torch
+import torch.nn as nn
 
 import datasets
 from datasets import load_dataset, load_metric
@@ -230,6 +234,14 @@ class DataTrainingArguments:
 
 
 class MLM_ClassifierTrainer(Trainer):
+    def __init__(self, label_token_ids_tensor, attr_distribution, attribute_loss, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.label_token_ids_tensor = label_token_ids_tensor
+        self.attr_distribution = attr_distribution
+        self.attribute_loss = attribute_loss
+        
+        
+        #dataset.set_format(type=dataset.format["type"], columns=list(dataset.features.keys()))
     # Link: https://discuss.huggingface.co/t/specify-loss-for-trainer-trainingarguments/10481
     # They get the logits and estimate loss on them. Maybe we can get logits AND we also need the labels as
     # global arguments?? 
@@ -241,23 +253,55 @@ class MLM_ClassifierTrainer(Trainer):
 
         Subclass and override for custom behavior.
         """
+        labels = inputs.pop("labels")
+        #outputs = model(**inputs)        
 
-        # What is the label_smoother? Default is None, label_smoothing_factor = 0
-        if self.label_smoother is not None and "labels" in inputs:
-            labels = inputs.pop("labels")
-        else:
-            labels = None
-        outputs = model(**inputs)
+        outputs = model(input_ids= inputs['input_ids'], attention_mask= inputs['attention_mask'])
+
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
         if self.args.past_index >= 0:
             self._past = outputs[self.args.past_index]
 
-        if labels is not None:
-            loss = self.label_smoother(outputs, labels)
+        # modify outputs logits and loss. We only keep the logits corresponding to the two labels.
+        # import pdb; pdb.set_trace()
+        mlm_logits = outputs['logits']
+        outputs['logits'] = mlm_logits[:, :, self.label_token_ids_tensor]
+        weight = torch.tensor([0.5, 0.1])
+
+        # Why putting both in CUDA? Is this redundant? 
+        weight.cuda() #This line alone didn't work...
+        if self.attribute_loss:
+            import pdb;pdb.set_trace()
+            loss = nn.CrossEntropyLoss(ignore_index=-100, weight=weight, reduction='none').cuda()(
+                outputs['logits'].view(-1, len(self.label_token_ids_tensor)), 
+                labels.view(-1)
+            )
+            attr_queries = inputs.pop("attribute_queries")
+            labels_flat = torch.flatten(labels)
+            indices = torch.nonzero(torch.where(labels_flat > -100, labels_flat, torch.zeros(len(labels_flat), dtype=int).cuda()))
+
+            for i, index in enumerate(indices):
+                loss[index] = loss[index] * self.attr_distribution[attr_queries[i]]
+            outputs['loss'] = torch.mean(loss[indices])
+            
         else:
-            # We don't use .loss here since the model may return tuples instead of ModelOutput.
-            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+            loss = nn.CrossEntropyLoss(ignore_index=-100, weight=weight).cuda()(
+                outputs['logits'].view(-1, len(self.label_token_ids_tensor)), 
+                labels.view(-1)
+            )
+            outputs['loss'] = loss
+        
+        # print(set(outputs['logits'].view(-1).tolist()))
+        # with open(f'{training_args.output_dir}/logits.txt', 'w') as outfile:
+        #     logits = outputs['logits'].view(-1, len(self.label_token_ids_tensor))
+        #     outfile.write(logits)
+
+        # if self.label_smoother is not None:
+        #     loss = self.label_smoother(outputs, labels)
+        # else:
+            
+        loss = outputs["loss"]
 
         return (loss, outputs) if return_outputs else loss
 
@@ -266,7 +310,6 @@ def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
-
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
@@ -451,13 +494,21 @@ def main():
 
     # When using line_by_line, we just tokenize each nonempty line.
     padding = "max_length" if data_args.pad_to_max_length else False
-
+    label_verbalizations = ['different', 'unchanged']
     label_token_ids = {
         # 'changed': tokenizer.convert_tokens_to_ids('Ġchanged'),
         # 'stable': tokenizer.convert_tokens_to_ids('Ġstable')
-        'different': tokenizer.convert_tokens_to_ids(tokenizer.tokenize(' different'))[0],
-        'unchanged': tokenizer.convert_tokens_to_ids(tokenizer.tokenize(' unchanged'))[0]
+        # 'different': tokenizer.convert_tokens_to_ids(tokenizer.tokenize(' different'))[0],
+        # 'unchanged': tokenizer.convert_tokens_to_ids(tokenizer.tokenize(' unchanged'))[0]
+        verbalization: tokenizer.convert_tokens_to_ids(tokenizer.tokenize(f' {verbalization}'))[0] \
+            for verbalization in label_verbalizations
     }
+    label_index = {l:i for i,l in enumerate(label_verbalizations)}
+    label_token_ids_tensor = torch.tensor(
+        [label_token_ids[verbalization] for verbalization in label_verbalizations], 
+        requires_grad=False
+    )
+    
 
     def tokenize_function(examples):
         # Join the data in a single 'text' column.
@@ -469,6 +520,7 @@ def main():
         texts = []
         texts_unmasked = []
         labels = []
+        attribute_queries = []
 
         for i in range(len(examples['queries'])):
             text = ''
@@ -482,7 +534,8 @@ def main():
                 for entity, attribute_changed in zip(query['entities'], query['attribute_changed']):
                     text += prompt.format(attribute, entity, mask_token)
                     text_unmasked += prompt.format(attribute, entity, 'different' if attribute_changed else 'unchanged')
-                    label.append(label_token_ids['different'] if attribute_changed else label_token_ids['unchanged'])
+                    label.append(label_index['different'] if attribute_changed else label_index['unchanged'])
+                    attribute_queries.append(attribute)
             texts.append(text)
             texts_unmasked.append(text_unmasked)
             labels.append(label)
@@ -496,6 +549,7 @@ def main():
             'texts':texts,
             'texts_unmasked':texts_unmasked,
             'labels':labels,
+            'attribute_queries':attribute_queries,
             **tokenizer(
                 texts,
                 padding=padding,
@@ -531,12 +585,18 @@ def main():
             eval_dataset = eval_dataset.select(range(data_args.max_eval_samples))
         
         def preprocess_logits_for_metrics(logits, labels):
+            # Note this is called after compute_loss.
             # import pdb; pdb.set_trace()
+            # print(logits)
             return logits.argmax(dim=-1)
 
         metric = load_metric("accuracy")
 
         def compute_metrics(eval_preds):
+            """
+            actual eval loop at line 2429:
+            /usr0/home/espiliop/transformers/src/transformers/trainer.py
+            """
             preds, labels = eval_preds
             # preds have the same shape as the labels, after the argmax(-1) has been calculated
             # by preprocess_logits_for_metrics
@@ -546,6 +606,9 @@ def main():
             labels = labels[mask]
             preds = preds[mask]
 
+            if len(preds) != len(eval_dataset["attribute_queries"]):
+                raise Exception("Error: Predictions are not from the same eval dataset!")
+
             with open(f'{training_args.output_dir}/predictions.jsonl', 'w') as outfile:
                 for l, p in zip(labels, preds):
                     outfile.write(f"{json.dumps({'label': int(l), 'pred': int(p)})}\n")
@@ -554,15 +617,24 @@ def main():
 
             score_names = ['f1', 'prec', 'rec']
 
-            for label in ['different', 'unchanged']:
+            for label in label_verbalizations:
                 for i, score in enumerate([
-                        f1_score_factory(label_token_ids[label]),
-                        precision_score_factory(label_token_ids[label]),
-                        recall_score_factory(label_token_ids[label])]
+                        f1_score_factory(label_index[label]),
+                        precision_score_factory(label_index[label]),
+                        recall_score_factory(label_index[label])]
                     ):
                     computed_score = score(labels, preds)
                     print(f'{label}_{score_names[i]}', computed_score)
                     metric_dict_output[f'{label}_{score_names[i]}'] = computed_score
+
+                    # New code here
+            label = label_verbalizations[0]
+            score = f1_score_factory(label_index[label])
+            for attribute in set(eval_dataset["attribute_queries"]):
+                indexes = [i for i, a in enumerate(eval_dataset["attribute_queries"]) if a == attribute]
+                attribute_score = score(labels[indexes], preds[indexes])
+                metric_dict_output[f'{label}_f1_{attribute}'] = attribute_score
+
             return metric_dict_output
             
     # Data collator
@@ -584,9 +656,18 @@ def main():
     #     compute_metrics=compute_metrics if training_args.do_eval else None,
     #     preprocess_logits_for_metrics=preprocess_logits_for_metrics if training_args.do_eval else None,
     # )
-    
+
+    # Why when we define our own Trainer this fails???
+    with open('/usr0/home/espiliop/pet/real_events/data/attr_distribution.json') as f:
+        attr_distribution = [json.loads(line) for line in f.readlines()]
+    total = sum(i["train"] for i in attr_distribution)
+    attr_distribution = {i["attr"]: total/(i["train"]*len(attr_distribution)) for i in attr_distribution}
+
     trainer = MLM_ClassifierTrainer(
+        label_token_ids_tensor=label_token_ids_tensor,
         model=model,
+        attr_distribution=attr_distribution,
+        attribute_loss= False,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
