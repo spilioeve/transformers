@@ -267,41 +267,84 @@ class MLM_ClassifierTrainer(Trainer):
         # import pdb; pdb.set_trace()
         mlm_logits = outputs['logits']
         outputs['logits'] = mlm_logits[:, :, self.label_token_ids_tensor]
-        weight = torch.tensor([0.5, 0.1])
+        # distribution: pos = 16558, neg = 86334, 102892
+        # 3.1, 0.6
+        weight = torch.tensor([3.1, 0.6]).to(device=mlm_logits.device)
 
-        # Why putting both in CUDA? Is this redundant? 
-        weight.cuda() #This line alone didn't work...
-        if self.attribute_loss:
-            import pdb;pdb.set_trace()
-            loss = nn.CrossEntropyLoss(ignore_index=-100, weight=weight, reduction='none').cuda()(
-                outputs['logits'].view(-1, len(self.label_token_ids_tensor)), 
-                labels.view(-1)
+
+        # Define loss (TODO: do it only once instead of every time we compute the loss)
+        # loss_fn = nn.CrossEntropyLoss(
+        #     ignore_index=-100, 
+        #     weight=weight,
+        #     label_smoothing=self.args.label_smoothing_factor,
+        #     reduction='none'
+        # )
+        loss_fn = nn.CrossEntropyLoss(
+            ignore_index=-100, 
+            label_smoothing=self.args.label_smoothing_factor,
+            reduction='none'
+        )
+        # Compute loss (no reduction)
+        loss = loss_fn(
+            outputs['logits'].view(-1, len(self.label_token_ids_tensor)), 
+            labels.view(-1)
+        )
+
+        # indices = labels != -100
+        indices = torch.nonzero(
+            torch.where(
+                labels.view(-1) > -100, 
+                torch.ones(len(labels.view(-1)), dtype=int).cuda(),
+                torch.zeros(len(labels.view(-1)), dtype=int).cuda()
+                )
             )
+        
+        # Attribute weight 
+        if self.attribute_loss:
             attr_queries = inputs.pop("attribute_queries")
-            labels_flat = torch.flatten(labels)
-            indices = torch.nonzero(torch.where(labels_flat > -100, labels_flat, torch.zeros(len(labels_flat), dtype=int).cuda()))
-
             for i, index in enumerate(indices):
                 loss[index] = loss[index] * self.attr_distribution[attr_queries[i]]
-            outputs['loss'] = torch.mean(loss[indices])
-            
-        else:
-            loss = nn.CrossEntropyLoss(ignore_index=-100, weight=weight).cuda()(
-                outputs['logits'].view(-1, len(self.label_token_ids_tensor)), 
-                labels.view(-1)
-            )
-            outputs['loss'] = loss
+            # TODO: turn everything into a tensor so that we avoid unwanted bugs... 
+            # ... they are always there when you least expect them to be!
+            # loss[indices] = loss[indices] * self.attr_distribution[torch.tensor(attr_queries)]
         
-        # print(set(outputs['logits'].view(-1).tolist()))
-        # with open(f'{training_args.output_dir}/logits.txt', 'w') as outfile:
-        #     logits = outputs['logits'].view(-1, len(self.label_token_ids_tensor))
-        #     outfile.write(logits)
+        loss = torch.mean(loss[indices])
+        outputs['loss'] = loss
 
-        # if self.label_smoother is not None:
-        #     loss = self.label_smoother(outputs, labels)
-        # else:
+
+        # # Why putting both in CUDA? Is this redundant? 
+        # weight.cuda() #This line alone didn't work...
+        # if self.attribute_loss:
+        #     import pdb;pdb.set_trace()
+        #     loss = nn.CrossEntropyLoss(ignore_index=-100, weight=weight, reduction='none').cuda()(
+        #         outputs['logits'].view(-1, len(self.label_token_ids_tensor)), 
+        #         labels.view(-1)
+        #     )
+        #     attr_queries = inputs.pop("attribute_queries")
+        #     labels_flat = torch.flatten(labels)
+        #     indices = torch.nonzero(torch.where(labels_flat > -100, labels_flat, torch.zeros(len(labels_flat), dtype=int).cuda()))
+
+        #     for i, index in enumerate(indices):
+        #         loss[index] = loss[index] * self.attr_distribution[attr_queries[i]]
+        #     outputs['loss'] = torch.mean(loss[indices])
             
-        loss = outputs["loss"]
+        # else:
+        #     loss = nn.CrossEntropyLoss(ignore_index=-100, weight=weight).cuda()(
+        #         outputs['logits'].view(-1, len(self.label_token_ids_tensor)), 
+        #         labels.view(-1)
+        #     )
+        #     outputs['loss'] = loss
+        
+        # # print(set(outputs['logits'].view(-1).tolist()))
+        # # with open(f'{training_args.output_dir}/logits.txt', 'w') as outfile:
+        # #     logits = outputs['logits'].view(-1, len(self.label_token_ids_tensor))
+        # #     outfile.write(logits)
+
+        # # if self.label_smoother is not None:
+        # #     loss = self.label_smoother(outputs, labels)
+        # # else:
+            
+        # loss = outputs["loss"]
 
         return (loss, outputs) if return_outputs else loss
 
@@ -661,7 +704,8 @@ def main():
     with open('/usr0/home/espiliop/pet/real_events/data/attr_distribution.json') as f:
         attr_distribution = [json.loads(line) for line in f.readlines()]
     total = sum(i["train"] for i in attr_distribution)
-    attr_distribution = {i["attr"]: total/(i["train"]*len(attr_distribution)) for i in attr_distribution}
+    attr_distribution = {i["attr"]: max(min(total/(i["train"]*len(attr_distribution)), 3.0), 0.1) for i in attr_distribution}
+    
 
     trainer = MLM_ClassifierTrainer(
         label_token_ids_tensor=label_token_ids_tensor,

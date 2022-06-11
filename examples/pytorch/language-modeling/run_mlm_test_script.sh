@@ -1,10 +1,9 @@
 python run_mlm.py \
-    --model_name_or_path "/usr0/home/espiliop/pet/real_events/outputs/prompt-mlm-merged-entities-simplified-subsample7-attr_weight/checkpoint-9000" \
-    --train_file "/usr0/home/espiliop/pet/real_events/data/gold-v1.1-prompt-mlm-merged-entities-simplified/train.json" \
+    --model_name_or_path roberta-large \
     --validation_file "/usr0/home/espiliop/pet/real_events/data/gold-v1.1-prompt-mlm-merged-entities-simplified/test.json" \
     --do_eval \
     --logging_first_step \
-    --output_dir "/usr0/home/espiliop/pet/real_events/outputs/prompt-mlm-test-merged-entities-simplified3-sub7-attr_weight/" \
+    --output_dir "/usr0/home/espiliop/pet/real_events/outputs/prompt-mlm-test-zeroshot" \
     --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 10 \
     --remove_unused_columns False\

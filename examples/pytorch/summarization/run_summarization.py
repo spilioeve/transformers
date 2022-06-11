@@ -18,6 +18,7 @@ Fine-tuning the library models for sequence to sequence.
 """
 # You can also adapt this script on your own sequence to sequence task. Pointers for this are left as comments.
 
+import torch
 import logging
 import os
 import sys
@@ -50,6 +51,8 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
+from sklearn.metrics import f1_score, recall_score, precision_score
+import json
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.17.0.dev0")
@@ -71,6 +74,38 @@ except (LookupError, OSError):
 # A list of all multilingual tokenizer which require lang attribute.
 MULTILINGUAL_TOKENIZERS = [MBartTokenizer, MBartTokenizerFast, MBart50Tokenizer, MBart50TokenizerFast]
 
+def f1_score_factory(label):
+    def f1_score_bin(y_true, y_pred):
+        return f1_score(
+            y_true, 
+            y_pred, 
+            pos_label=label, 
+            average="binary",
+            zero_division=0,
+        )
+    return f1_score_bin
+
+def precision_score_factory(label):
+    def precision_score_bin(y_true, y_pred):
+        return precision_score(
+            y_true, 
+            y_pred, 
+            pos_label=label, 
+            average="binary",
+            zero_division=0,
+        )
+    return precision_score_bin
+
+def recall_score_factory(label):
+    def recall_score_bin(y_true, y_pred):
+        return recall_score(
+            y_true, 
+            y_pred, 
+            pos_label=label, 
+            average="binary",
+            zero_division=0,
+        )
+    return recall_score_bin
 
 @dataclass
 class ModelArguments:
@@ -356,6 +391,7 @@ def main():
             data_files["test"] = data_args.test_file
             extension = data_args.test_file.split(".")[-1]
         raw_datasets = load_dataset(extension, data_files=data_files, cache_dir=model_args.cache_dir)
+    
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
@@ -474,9 +510,24 @@ def main():
             f"`{model.__class__.__name__}`. This will lead to loss being calculated twice and will take up more memory"
         )
 
+    # Added code for label verbalizations
+    label_verbalizations = ['different', 'unchanged']
+    label_token_ids = {
+        # 'changed': tokenizer.convert_tokens_to_ids('Ġchanged'),
+        # 'stable': tokenizer.convert_tokens_to_ids('Ġstable')
+        # 'different': tokenizer.convert_tokens_to_ids(tokenizer.tokenize(' different'))[0],
+        # 'unchanged': tokenizer.convert_tokens_to_ids(tokenizer.tokenize(' unchanged'))[0]
+        verbalization: tokenizer.convert_tokens_to_ids(tokenizer.tokenize(f' {verbalization}'))[0] \
+            for verbalization in label_verbalizations
+    }
+    label_index = {l:i for i,l in enumerate(label_verbalizations)}
+    label_token_ids_tensor = torch.tensor(
+        [label_token_ids[verbalization] for verbalization in label_verbalizations], 
+        requires_grad=False
+    )
+
     def preprocess_function(examples):
         # remove pairs where at least one record is None
-
         inputs, targets = [], []
         for i in range(len(examples[text_column])):
             if examples[text_column][i] is not None and examples[summary_column][i] is not None:
@@ -574,6 +625,7 @@ def main():
 
     def compute_metrics(eval_preds):
         preds, labels = eval_preds
+      
         if isinstance(preds, tuple):
             preds = preds[0]
         decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
@@ -585,14 +637,111 @@ def main():
         # Some simple post-processing
         decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
 
+        # WTF is wrong here??? Just run a normal model instead?
+        try:
+            model_predictions = torch.tensor([int(i.split()[-1].strip('.') == "unchanged") for i in decoded_preds])
+            model_labels = torch.tensor([int(i.split()[-1].strip('.') == "unchanged") for i in decoded_labels])
+        except:
+            import pdb; pdb.set_trace()
         result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
         # Extract a few results from ROUGE
         result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
+
+
+        with open(f'{training_args.output_dir}/predictions.jsonl', 'w') as outfile:
+            for l, p in zip(decoded_labels, decoded_preds):
+                outfile.write(f"{json.dumps({'label': l, 'pred': p})}\n")
+
+        #metric_dict_output = metric.compute(predictions=preds, references=labels)
+
+        score_names = ['f1', 'prec', 'rec']
+
+        for label in label_verbalizations:
+            for i, score in enumerate([
+                    f1_score_factory(label_index[label]),
+                    precision_score_factory(label_index[label]),
+                    recall_score_factory(label_index[label])]
+                ):
+                computed_score = score(model_labels, model_predictions)
+                print(f'{label}_{score_names[i]}', computed_score)
+                result[f'{label}_{score_names[i]}'] = computed_score
+
+        attributes = [i.split()[1] for i in decoded_labels]
+        label = label_verbalizations[0]
+        score = f1_score_factory(label_index[label])
+        for attribute in set(attributes):
+            indexes = [i for i, a in enumerate(attributes) if a == attribute]
+            attribute_score = score(model_labels[indexes], model_predictions[indexes])
+            result[f'{label}_f1_{attribute}'] = attribute_score
 
         prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
         result["gen_len"] = np.mean(prediction_lens)
         result = {k: round(v, 4) for k, v in result.items()}
         return result
+
+    def compute_metrics2(eval_preds):
+        preds, labels = eval_preds
+      
+        if isinstance(preds, tuple):
+            preds = preds[0]
+        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+        if data_args.ignore_pad_token_for_loss:
+            # Replace -100 in the labels as we can't decode them.
+            labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+        # Some simple post-processing
+        decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
+
+        with open('/usr0/home/espiliop/pet/real_events/attributes_out_domain.txt') as infile:
+            attributes = [line.strip().split(',')[0] for line in infile.readlines()]
+
+        model_predictions = torch.tensor([int(attr in instance.split(' of the')[0]) for instance in decoded_preds for attr in attributes]).view((len(decoded_preds), len(attributes)))
+        model_labels = torch.tensor([int(attr in instance.split(' of the')[0]) for instance in decoded_labels for attr in attributes]).view((len(decoded_preds), len(attributes)))
+
+        result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
+        # Extract a few results from ROUGE
+        result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
+
+
+        with open(f'{training_args.output_dir}/predictions.jsonl', 'w') as outfile:
+            for l, p in zip(decoded_labels, decoded_preds):
+                outfile.write(f"{json.dumps({'label': l, 'pred': p})}\n")
+
+        #metric_dict_output = metric.compute(predictions=preds, references=labels)
+
+        score_names = ['f1', 'prec', 'rec']
+
+        label_index = {'different': 1, 'unchanged': 0}
+        for label in label_index:
+            for i, score in enumerate([
+                    f1_score_factory(label_index[label]),
+                    precision_score_factory(label_index[label]),
+                    recall_score_factory(label_index[label])]
+                ):
+                computed_score = score(model_labels.flatten(), model_predictions.flatten())
+                print(f'{label}_{score_names[i]}', computed_score)
+                result[f'{label}_{score_names[i]}'] = computed_score
+
+        # TODO: Add code for attribute eval here
+  
+        label = 'different'
+        score = f1_score_factory(label_index[label])
+        for i, attribute in enumerate(attributes):
+            preds_i = model_predictions[:, i]
+            labels_i = model_labels[:, i]
+            attribute_score = score(labels_i, preds_i)
+            result[f'{label}_f1_{attribute}'] = attribute_score
+        # for attribute in set(eval_dataset["attribute_queries"]):
+        #     indexes = [i for i, a in enumerate(eval_dataset["attribute_queries"]) if a == attribute]
+        #     attribute_score = score(labels[indexes], preds[indexes])
+        #     result[f'{label}_f1_{attribute}'] = attribute_score
+
+        prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
+        result["gen_len"] = np.mean(prediction_lens)
+        result = {k: round(v, 4) for k, v in result.items()}
+        return result
+ 
 
     # Initialize our Trainer
     trainer = Seq2SeqTrainer(
@@ -602,7 +751,7 @@ def main():
         eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        compute_metrics=compute_metrics if training_args.predict_with_generate else None,
+        compute_metrics=compute_metrics2 if training_args.predict_with_generate else None,
     )
 
     # Training
