@@ -679,9 +679,9 @@ def main():
         result = {k: round(v, 4) for k, v in result.items()}
         return result
 
-    def compute_metrics2(eval_preds):
+    def compute_metrics_multi_attr(eval_preds):
         preds, labels = eval_preds
-      
+
         if isinstance(preds, tuple):
             preds = preds[0]
         decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
@@ -693,12 +693,15 @@ def main():
         # Some simple post-processing
         decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
 
-        with open('/usr0/home/espiliop/pet/real_events/attributes_out_domain.txt') as infile:
+        with open('/usr0/home/espiliop/pet/real_events/attributes_merged.txt') as infile:
             attributes = [line.strip().split(',')[0] for line in infile.readlines()]
+
+        # TODO: for k-attr prompt we need to check which attributes are queried. Otherwise it would count them as negative by
+        # default, even if the attribute is not mentioned
 
         model_predictions = torch.tensor([int(attr in instance.split(' of the')[0]) for instance in decoded_preds for attr in attributes]).view((len(decoded_preds), len(attributes)))
         model_labels = torch.tensor([int(attr in instance.split(' of the')[0]) for instance in decoded_labels for attr in attributes]).view((len(decoded_preds), len(attributes)))
-
+       
         result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
         # Extract a few results from ROUGE
         result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
@@ -742,7 +745,93 @@ def main():
         result = {k: round(v, 4) for k, v in result.items()}
         return result
  
+    def compute_metrics_k_attr(eval_preds):
+        preds, labels = eval_preds
+     
+        
+        if isinstance(preds, tuple):
+            preds = preds[0]
+        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+        if data_args.ignore_pad_token_for_loss:
+            # Replace -100 in the labels as we can't decode them.
+            labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
 
+        # Some simple post-processing
+        decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
+
+        with open('/usr0/home/espiliop/pet/real_events/attributes_merged.txt') as infile:
+            attributes = [line.strip().split(',')[0] for line in infile.readlines()]
+
+        # TODO: for k-attr prompt we need to check which attributes are queried. Otherwise it would count them as negative by
+        # default, even if the attribute is not mentioned
+
+    
+
+        result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
+        # Extract a few results from ROUGE
+        result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
+
+
+        with open(f'{training_args.output_dir}/predictions.jsonl', 'w') as outfile:
+            for l, p in zip(decoded_labels, decoded_preds):
+                outfile.write(f"{json.dumps({'label': l, 'pred': p})}\n")
+
+        #metric_dict_output = metric.compute(predictions=preds, references=labels)
+
+        #model_predictions = torch.tensor([int(attr in instance.split(' of the')[0]) for instance in decoded_preds for attr in attributes]).view((len(decoded_preds), len(attributes)))
+        #model_labels = torch.tensor([int(attr in instance.split(' of the')[0]) for instance in decoded_labels for attr in attributes]).view((len(decoded_preds), len(attributes)))
+
+        query_attributes = [text.split('. context')[0].split(', ')[1:] for text in tokenizer.batch_decode(eval_dataset['input_ids'], skip_special_tokens=True)]
+        
+        model_labels = []
+        model_predictions = []
+        attribute_indexes = {attr:[] for attr in attributes}
+        curr_index = 0
+        
+        for i, pred_i in enumerate(decoded_preds):
+            label_i = decoded_labels[i]
+            for attr in query_attributes[i]:
+                model_labels += [int(attr in label_i.split(' of the')[0])]
+                model_predictions += [int(attr in pred_i.split(' of the')[0])]
+                attribute_indexes[attr].append(curr_index)
+                curr_index += 1
+
+        model_predictions = torch.tensor(model_predictions)
+        model_labels = torch.tensor(model_labels)
+
+        score_names = ['f1', 'prec', 'rec']
+        
+
+        label_index = {'different': 1, 'unchanged': 0}
+        for label in label_index:
+            for i, score in enumerate([
+                    f1_score_factory(label_index[label]),
+                    precision_score_factory(label_index[label]),
+                    recall_score_factory(label_index[label])]
+                ):
+                computed_score = score(model_labels, model_predictions)
+                print(f'{label}_{score_names[i]}', computed_score)
+                result[f'{label}_{score_names[i]}'] = computed_score
+
+        
+        label = 'different'
+        score = f1_score_factory(label_index[label])
+        for attr in attributes:
+            preds_i = model_predictions[attribute_indexes[attr]]
+            labels_i = model_labels[attribute_indexes[attr]]
+            attribute_score = score(labels_i, preds_i)
+            result[f'{label}_f1_{attr}'] = attribute_score
+        # for attribute in set(eval_dataset["attribute_queries"]):
+        #     indexes = [i for i, a in enumerate(eval_dataset["attribute_queries"]) if a == attribute]
+        #     attribute_score = score(labels[indexes], preds[indexes])
+        #     result[f'{label}_f1_{attribute}'] = attribute_score
+
+        prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
+        result["gen_len"] = np.mean(prediction_lens)
+        result = {k: round(v, 4) for k, v in result.items()}
+        return result
+    
     # Initialize our Trainer
     trainer = Seq2SeqTrainer(
         model=model,
@@ -751,7 +840,7 @@ def main():
         eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        compute_metrics=compute_metrics2 if training_args.predict_with_generate else None,
+        compute_metrics=compute_metrics_k_attr if training_args.predict_with_generate else None,
     )
 
     # Training
