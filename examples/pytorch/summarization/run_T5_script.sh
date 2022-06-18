@@ -1,14 +1,14 @@
-python run_summarization.py \
-    --model_name_or_path t5-base \
-    --train_file "/usr0/home/espiliop/pet/real_events/data/gold-v1.1-prompt-t5-merged-entities-k_prompts-1/train.json" \
-    --validation_file "/usr0/home/espiliop/pet/real_events/data/gold-v1.1-prompt-t5-merged-entities-k_prompts-1/dev.json" \
+python run_summarization-piglet.py \
+    --model_name_or_path t5-small \
+    --train_file "/usr0/home/espiliop/pet/virtual_events/data/prompt-t5-merged_prompts-entity_change/train.json" \
+    --validation_file "/usr0/home/espiliop/pet/virtual_events/data/prompt-t5-merged_prompts-entity_change/dev.json" \
     --do_train \
     --do_eval \
     --logging_first_step \
-    --output_dir "/usr0/home/espiliop/pet/real_events/outputs/prompt-t5_base-merged-entities-k_prompts-1" \
+    --output_dir "/usr0/home/espiliop/pet/virtual_events/output_t5/prompt-t5_base-merged_prompts" \
     --predict_with_generate \
-    --per_device_train_batch_size 8 \
-    --per_device_eval_batch_size 10 \
+    --per_device_train_batch_size 4 \
+    --per_device_eval_batch_size 4 \
     --save_total_limit 2 \
     --evaluation_strategy steps \
     --logging_steps 500 \
