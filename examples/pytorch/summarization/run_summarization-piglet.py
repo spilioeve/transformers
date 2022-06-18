@@ -644,9 +644,9 @@ def main():
         }
         attributes = [attribute_dict[attr] for attr in attribute_dict]
 
-        model_predictions = torch.tensor([int(attr in instance.split(' for the')[0]) for instance in decoded_preds for attr in attributes])
-        model_labels = torch.tensor([int(attr in instance.split(' for the')[0]) for instance in decoded_labels for attr in attributes])
-       
+        model_predictions = torch.tensor([int(attr in instance.split(' for the')[0]) for instance in decoded_preds for attr in attributes]).view((len(decoded_preds), len(attributes)))
+        model_labels = torch.tensor([int(attr in instance.split(' for the')[0]) for instance in decoded_labels for attr in attributes]).view((len(decoded_preds), len(attributes)))
+
 
         result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
         # Extract a few results from ROUGE
